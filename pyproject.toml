@@ -16,6 +16,7 @@ dependencies = [
   "onnxruntime",
   "piper-phonemize",
   "pydub",
+  "pyopenjtalk-plus",
   "pypinyin",
   "safetensors",
   "setuptools<81",
@@ -46,3 +47,8 @@ linacodec = { git = "https://github.com/ysharma3501/LinaCodec.git" }
 
 [tool.uv.build-backend]
 module-root = "" # The root module of the project
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

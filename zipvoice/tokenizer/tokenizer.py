@@ -27,7 +27,11 @@ from lhotse import CutSet
 from pypinyin import Style, lazy_pinyin
 from pypinyin.contrib.tone_convert import to_finals_tone3, to_initials
 
-from zipvoice.tokenizer.normalizer import ChineseTextNormalizer, EnglishTextNormalizer
+from zipvoice.tokenizer.normalizer import (
+    ChineseTextNormalizer,
+    EnglishTextNormalizer,
+    JapaneseTextNormalizer,
+)
 
 try:
     from piper_phonemize import phonemize_espeak
@@ -37,6 +41,13 @@ except Exception as ex:
         "pip install piper_phonemize -f \
             https://k2-fsa.github.io/icefall/piper_phonemize.html"
     )
+
+try:
+    import pyopenjtalk
+
+    _HAS_PYOPENJTALK = True
+except ImportError:
+    _HAS_PYOPENJTALK = False
 
 jieba.default_logger.setLevel(logging.INFO)
 
@@ -199,18 +210,22 @@ class EspeakTokenizer(Tokenizer):
 
 
 class EmiliaTokenizer(Tokenizer):
-    def __init__(self, token_file: Optional[str] = None, token_type="phone"):
+    def __init__(self, token_file: Optional[str] = None, token_type="phone", lang: Optional[str] = None):
         """
         Args:
           tokens: the file that contains information that maps tokens to ids,
             which is a text file with '{token}\t{token_id}' per line.
+          lang: language hint for CJK character classification.
+            Set to "ja" to treat CJK characters as Japanese.
         """
         assert (
             token_type == "phone"
         ), f"Only support phone tokenizer for Emilia, but get {token_type}."
 
+        self.lang = lang
         self.english_normalizer = EnglishTextNormalizer()
         self.chinese_normalizer = ChineseTextNormalizer()
+        self.japanese_normalizer = JapaneseTextNormalizer()
 
         self.has_tokens = False
         if token_file is None:
@@ -253,7 +268,6 @@ class EmiliaTokenizer(Tokenizer):
 
         phoneme_list = []
         for text in texts:
-            # now only en and ch
             segments = self.get_segment(text)
             all_phoneme = []
             for index in range(len(segments)):
@@ -262,14 +276,15 @@ class EmiliaTokenizer(Tokenizer):
                     phoneme = self.tokenize_ZH(seg[0])
                 elif seg[1] == "en":
                     phoneme = self.tokenize_EN(seg[0])
+                elif seg[1] == "ja":
+                    phoneme = self.tokenize_JA(seg[0])
                 elif seg[1] == "pinyin":
                     phoneme = self.tokenize_pinyin(seg[0])
                 elif seg[1] == "tag":
                     phoneme = [seg[0]]
                 else:
                     logging.warning(
-                        f"No English or Chinese characters found, \
-                            skipping segment of unknown language: {seg}"
+                        f"Skipping segment of unknown language: {seg}"
                     )
                     continue
                 all_phoneme += phoneme
@@ -326,6 +341,27 @@ class EmiliaTokenizer(Tokenizer):
             return tokens
         except Exception as ex:
             logging.warning(f"Tokenization of English texts failed: {ex}")
+            return []
+
+    def tokenize_JA(self, text: str) -> List[str]:
+        try:
+            if not _HAS_PYOPENJTALK:
+                raise ImportError(
+                    "pyopenjtalk-plus is required for Japanese tokenization. "
+                    "Install it with: pip install pyopenjtalk-plus"
+                )
+            text = self.japanese_normalizer.normalize(text)
+            phonemes = pyopenjtalk.g2p(text, join=False)
+            # Add J_ prefix to avoid namespace collision with espeak/pinyin phonemes
+            # (similar to "0" suffix used for Chinese initials)
+            ja_phones = []
+            for p in phonemes:
+                if p == "sil":
+                    continue
+                ja_phones.append(f"J_{p}")
+            return ja_phones
+        except Exception as ex:
+            logging.warning(f"Tokenization of Japanese texts failed: {ex}")
             return []
 
     def tokenize_pinyin(self, text: str) -> List[str]:
@@ -413,8 +449,15 @@ class EmiliaTokenizer(Tokenizer):
         text = _part_pattern.findall(text)
 
         for i, part in enumerate(text):
-            if self.is_chinese(part) or self.is_pinyin(part):
+            if self.is_pinyin(part):
                 types.append("zh")
+            elif self.is_japanese(part):
+                types.append("ja")
+            elif self.is_chinese(part):
+                if self.lang == "ja":
+                    types.append("ja")
+                else:
+                    types.append("zh")
             elif self.is_alphabet(part):
                 types.append("en")
             else:
@@ -477,6 +520,15 @@ class EmiliaTokenizer(Tokenizer):
             return True
         else:
             return False
+
+    def is_hiragana(self, char: str) -> bool:
+        return char >= "\u3040" and char <= "\u309f"
+
+    def is_katakana(self, char: str) -> bool:
+        return char >= "\u30a0" and char <= "\u30ff"
+
+    def is_japanese(self, char: str) -> bool:
+        return self.is_hiragana(char) or self.is_katakana(char)
 
     def is_alphabet(self, char: str) -> bool:
         if (char >= "\u0041" and char <= "\u005a") or (

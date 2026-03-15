@@ -158,6 +158,28 @@ class EnglishTextNormalizer(TextNormalizer):
         return text
 
 
+class JapaneseTextNormalizer(TextNormalizer):
+    """A class to handle preprocessing of Japanese text including normalization."""
+
+    def __init__(self):
+        self._fullwidth_num = str.maketrans(
+            "０１２３４５６７８９",
+            "0123456789",
+        )
+        self._fullwidth_alpha = str.maketrans(
+            "ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ"
+            "ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            "abcdefghijklmnopqrstuvwxyz",
+        )
+
+    def normalize(self, text: str) -> str:
+        """Normalize text: full-width alphanumeric to half-width."""
+        text = text.translate(self._fullwidth_num)
+        text = text.translate(self._fullwidth_alpha)
+        return text
+
+
 class ChineseTextNormalizer(TextNormalizer):
     """
     A class to handle preprocessing of Chinese text including normalization.
