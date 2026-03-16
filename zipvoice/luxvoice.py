@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from zipvoice.modeling_utils import process_audio, generate, load_models_gpu, load_models_cpu
 from zipvoice.onnx_modeling import generate_cpu
@@ -7,9 +9,11 @@ class LuxTTS:
     LuxTTS class for encoding prompt and generating speech on cpu/cuda/mps.
     """
 
-    def __init__(self, model_path='YatharthS/LuxTTS', device='cuda', threads=4):
+    def __init__(self, model_path='YatharthS/LuxTTS', device='cuda', threads=4, lang: Optional[str] = None):
         if model_path == 'YatharthS/LuxTTS':
             model_path = None
+
+        self.lang = lang
 
         # Auto-detect better device if cuda is requested but not available
         if device == 'cuda' and not torch.cuda.is_available():
@@ -21,10 +25,10 @@ class LuxTTS:
                 device = 'cpu'
 
         if device == 'cpu':
-            model, feature_extractor, vocos, tokenizer, transcriber = load_models_cpu(model_path, threads)
+            model, feature_extractor, vocos, tokenizer, transcriber = load_models_cpu(model_path, threads, lang=lang)
             print("Loading model on CPU")
         else:
-            model, feature_extractor, vocos, tokenizer, transcriber = load_models_gpu(model_path, device=device)
+            model, feature_extractor, vocos, tokenizer, transcriber = load_models_gpu(model_path, device=device, lang=lang)
             print("Loading model on GPU")
 
         self.model = model

@@ -55,6 +55,18 @@ class TestJapaneseTextNormalizer:
     def test_mixed_fullwidth_and_normal(self, normalizer):
         assert normalizer.normalize("テスト１２３abc") == "テスト123abc"
 
+    def test_empty_string(self, normalizer):
+        assert normalizer.normalize("") == ""
+
+    def test_halfwidth_katakana_to_fullwidth(self, normalizer):
+        assert normalizer.normalize("ｱｲｳｴｵ") == "アイウエオ"
+
+    def test_fullwidth_space(self, normalizer):
+        assert normalizer.normalize("テスト\u3000テスト") == "テスト テスト"
+
+    def test_idempotent(self, normalizer):
+        assert normalizer.normalize("abc123") == "abc123"
+
 
 # ---------------------------------------------------------------------------
 # 2. is_hiragana()
@@ -96,6 +108,14 @@ class TestIsJapanese:
     @pytest.mark.parametrize("char", ["漢", "A", "1", ","])
     def test_kanji_and_ascii_return_false(self, tokenizer, char):
         assert tokenizer.is_japanese(char) is False
+
+    @pytest.mark.parametrize("char", ["ｱ", "ｶ", "ﾝ"])
+    def test_halfwidth_katakana_returns_true(self, tokenizer, char):
+        assert tokenizer.is_japanese(char) is True
+
+    @pytest.mark.parametrize("char", ["\u31f0", "\u31f5", "\u31ff"])
+    def test_katakana_extension_returns_true(self, tokenizer, char):
+        assert tokenizer.is_japanese(char) is True
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +163,19 @@ class TestGetSegmentLangJa:
         langs = [seg[1] for seg in segments]
         assert all(l in ("ja", "other") for l in langs)
 
+    def test_three_way_mixed(self, tokenizer_ja):
+        """Japanese + English + CJK text should produce ja and en segments."""
+        segments = tokenizer_ja.get_segment("こんにちはHello漢字")
+        langs = [seg[1] for seg in segments]
+        assert "ja" in langs
+        assert "en" in langs
+
+    def test_numbers_with_japanese(self, tokenizer_ja):
+        """Numbers mixed with Japanese text like '3月15日'."""
+        segments = tokenizer_ja.get_segment("3月15日")
+        langs = [seg[1] for seg in segments]
+        assert "ja" in langs
+
 
 # ---------------------------------------------------------------------------
 # 7. tokenize_JA() -- requires pyopenjtalk-plus
@@ -176,9 +209,39 @@ class TestTokenizeJA:
         assert "J_sil" not in phonemes
         assert "sil" not in phonemes
 
+    def test_katakana_input(self, tokenizer):
+        phonemes = tokenizer.tokenize_JA("カタカナ")
+        assert len(phonemes) > 0
+        assert all(p.startswith("J_") for p in phonemes)
+
+    def test_mixed_hiragana_katakana(self, tokenizer):
+        phonemes = tokenizer.tokenize_JA("こんにちはカタカナ")
+        assert len(phonemes) > 0
+        assert all(p.startswith("J_") for p in phonemes)
+
+    def test_numbers_in_japanese(self, tokenizer):
+        phonemes = tokenizer.tokenize_JA("3つのりんご")
+        assert len(phonemes) > 0
+
+    def test_japanese_punctuation(self, tokenizer):
+        phonemes = tokenizer.tokenize_JA("こんにちは。")
+        assert len(phonemes) > 0
+        assert all(p.startswith("J_") for p in phonemes)
+
 
 # ---------------------------------------------------------------------------
-# 8. texts_to_tokens() -- integration
+# 8. Half-width katakana segmentation
+# ---------------------------------------------------------------------------
+
+class TestHalfwidthKatakana:
+    def test_halfwidth_katakana_segmented_as_japanese(self, tokenizer_ja):
+        segments = tokenizer_ja.get_segment("ｶﾀｶﾅ")
+        langs = [seg[1] for seg in segments]
+        assert "ja" in langs
+
+
+# ---------------------------------------------------------------------------
+# 9. texts_to_tokens() -- integration
 # ---------------------------------------------------------------------------
 
 class TestTextsToTokensIntegration:

@@ -172,11 +172,22 @@ class JapaneseTextNormalizer(TextNormalizer):
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             "abcdefghijklmnopqrstuvwxyz",
         )
+        self._halfwidth_katakana = str.maketrans(
+            "ｦｧｨｩｪｫｬｭｮｯｰｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝﾞﾟ",
+            "ヲァィゥェォャュョッーアイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワン゛゜",
+        )
+        self._fullwidth_space = str.maketrans(
+            "\u3000",
+            " ",
+        )
 
     def normalize(self, text: str) -> str:
-        """Normalize text: full-width alphanumeric to half-width."""
+        """Normalize text: full-width alphanumeric to half-width,
+        half-width katakana to full-width, full-width space to regular space."""
         text = text.translate(self._fullwidth_num)
         text = text.translate(self._fullwidth_alpha)
+        text = text.translate(self._halfwidth_katakana)
+        text = text.translate(self._fullwidth_space)
         return text
 
 

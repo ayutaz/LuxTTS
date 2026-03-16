@@ -516,7 +516,7 @@ class EmiliaTokenizer(Tokenizer):
         return result
 
     def is_chinese(self, char: str) -> bool:
-        if char >= "\u4e00" and char <= "\u9fa5":
+        if char >= "\u4e00" and char <= "\u9fff":
             return True
         else:
             return False
@@ -525,10 +525,13 @@ class EmiliaTokenizer(Tokenizer):
         return char >= "\u3040" and char <= "\u309f"
 
     def is_katakana(self, char: str) -> bool:
-        return char >= "\u30a0" and char <= "\u30ff"
+        return (char >= "\u30a0" and char <= "\u30ff") or (char >= "\u31f0" and char <= "\u31ff")
+
+    def is_halfwidth_katakana(self, char):
+        return '\uff65' <= char <= '\uff9f'
 
     def is_japanese(self, char: str) -> bool:
-        return self.is_hiragana(char) or self.is_katakana(char)
+        return self.is_hiragana(char) or self.is_katakana(char) or self.is_halfwidth_katakana(char)
 
     def is_alphabet(self, char: str) -> bool:
         if (char >= "\u0041" and char <= "\u005a") or (
@@ -552,8 +555,8 @@ class EmiliaTokenizer(Tokenizer):
 
 
 class DialogTokenizer(EmiliaTokenizer):
-    def __init__(self, token_file: Optional[str] = None, token_type="phone"):
-        super().__init__(token_file=token_file, token_type=token_type)
+    def __init__(self, token_file: Optional[str] = None, token_type="phone", lang: Optional[str] = None):
+        super().__init__(token_file=token_file, token_type=token_type, lang=lang)
         if token_file:
             self.spk_a_id = self.token2id["[S1]"]
             self.spk_b_id = self.token2id["[S2]"]
@@ -665,11 +668,11 @@ class LibriTTSTokenizer(Tokenizer):
 
 def add_tokens(cut_set: CutSet, tokenizer: str, lang: str):
     if tokenizer == "emilia":
-        tokenizer = EmiliaTokenizer()
+        tokenizer = EmiliaTokenizer(lang=lang)
     elif tokenizer == "espeak":
         tokenizer = EspeakTokenizer(lang=lang)
     elif tokenizer == "dialog":
-        tokenizer = DialogTokenizer()
+        tokenizer = DialogTokenizer(lang=lang)
     elif tokenizer == "libritts":
         tokenizer = LibriTTSTokenizer()
     elif tokenizer == "simple":

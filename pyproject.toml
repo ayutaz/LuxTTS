@@ -13,7 +13,7 @@ dependencies = [
   "librosa",
   "linacodec",
   "numpy",
-  "onnxruntime",
+  "onnxruntime<=1.23.2",
   "piper-phonemize",
   "pydub",
   "pyopenjtalk-plus",

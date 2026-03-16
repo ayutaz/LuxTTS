@@ -23,3 +23,6 @@ jieba
 piper_phonemize
 pypinyin
 setuptools<81
+
+# Japanese g2p
+pyopenjtalk-plus

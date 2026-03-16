@@ -90,7 +90,7 @@ def generate(prompt_tokens, prompt_features_lens, prompt_features, prompt_rms, t
 
     return wav
 
-def load_models_gpu(model_path=None, device="cuda"):
+def load_models_gpu(model_path=None, device="cuda", lang=None):
     params = LuxTTSConfig()
     if model_path is None:
         model_path = snapshot_download("YatharthS/LuxTTS")
@@ -99,8 +99,8 @@ def load_models_gpu(model_path=None, device="cuda"):
     model_ckpt = f"{model_path}/model.pt"
     model_config = f"{model_path}/config.json"
 
-    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-base", device=device)
-    tokenizer = EmiliaTokenizer(token_file=token_file)
+    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-large-v3", device=device)
+    tokenizer = EmiliaTokenizer(token_file=token_file, lang=lang)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
     with open(model_config, "r") as f:
@@ -124,7 +124,7 @@ def load_models_gpu(model_path=None, device="cuda"):
     params.sampling_rate = model_config["feature"]["sampling_rate"]
     return model, feature_extractor, vocos, tokenizer, transcriber
 
-def load_models_cpu(model_path = None, num_thread=2):
+def load_models_cpu(model_path = None, num_thread=2, lang=None):
     params = LuxTTSConfig()
     params.seed = 42
 
@@ -135,9 +135,9 @@ def load_models_cpu(model_path = None, num_thread=2):
     fm_decoder_path = f"{model_path}/fm_decoder.onnx"
     model_config  = f"{model_path}/config.json"
 
-    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-tiny", device='cpu')
+    transcriber = pipeline("automatic-speech-recognition", model="openai/whisper-small", device='cpu')
 
-    tokenizer = EmiliaTokenizer(token_file=token_file)
+    tokenizer = EmiliaTokenizer(token_file=token_file, lang=lang)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
     with open(model_config, "r") as f:

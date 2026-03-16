@@ -154,8 +154,9 @@ def get_parser():
         "--lang",
         type=str,
         default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+        help="Language identifier, used when tokenizer type is espeak "
+        "(see https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md) "
+        "or emilia (set to 'ja' for Japanese g2p support).",
     )
 
     parser.add_argument(
@@ -782,7 +783,7 @@ def main():
         )
 
     if params.tokenizer == "emilia":
-        tokenizer = EmiliaTokenizer(token_file=token_file)
+        tokenizer = EmiliaTokenizer(token_file=token_file, lang=params.lang)
     elif params.tokenizer == "libritts":
         tokenizer = LibriTTSTokenizer(token_file=token_file)
     elif params.tokenizer == "espeak":

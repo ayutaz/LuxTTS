@@ -311,6 +311,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--lang",
+        type=str,
+        default=None,
+        help="Language identifier for the tokenizer "
+        "(set to 'ja' for Japanese g2p support).",
+    )
+
+    parser.add_argument(
         "--token-file",
         type=str,
         default="data/tokens_dialog.txt",
@@ -748,7 +756,7 @@ def run(rank, world_size, args):
         params.device = torch.device("cpu")
     logging.info(f"Device: {params.device}")
 
-    tokenizer = DialogTokenizer(token_file=params.token_file)
+    tokenizer = DialogTokenizer(token_file=params.token_file, lang=params.lang)
     tokenizer_config = {
         "vocab_size": tokenizer.vocab_size,
         "pad_id": tokenizer.pad_id,

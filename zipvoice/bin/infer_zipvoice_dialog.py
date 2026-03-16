@@ -227,6 +227,14 @@ def get_parser():
         "speech (edge silences will be removed by default).",
     )
 
+    parser.add_argument(
+        "--lang",
+        type=str,
+        default=None,
+        help="Language identifier for the tokenizer "
+        "(set to 'ja' for Japanese g2p support).",
+    )
+
     return parser
 
 
@@ -1193,7 +1201,7 @@ def main():
             HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/tokens.txt"
         )
 
-    tokenizer = DialogTokenizer(token_file=token_file)
+    tokenizer = DialogTokenizer(token_file=token_file, lang=params.lang)
 
     tokenizer_config = {
         "vocab_size": tokenizer.vocab_size,

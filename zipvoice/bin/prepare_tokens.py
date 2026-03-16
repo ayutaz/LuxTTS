@@ -46,8 +46,10 @@ def get_args():
         "--lang",
         type=str,
         default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+        help="Language identifier. For espeak tokenizer, see "
+        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md . "
+        "For emilia/dialog tokenizer, set to 'ja' to enable Japanese g2p "
+        "so that CJK characters are treated as Japanese instead of Chinese.",
     )
 
     return parser.parse_args()
