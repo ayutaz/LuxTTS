@@ -54,6 +54,25 @@ python3 -m zipvoice.bin.train_zipvoice_distill \
     --teacher-model exp/zipvoice_distill_1stage/iter-60000-avg-7.pt \
     --distill-stage second \
     --exp-dir exp/zipvoice_distill
+
+(3) Fine-tuning mode (e.g., for Japanese language adaptation).
+python3 -m zipvoice.bin.train_zipvoice_distill \
+    --world-size 1 \
+    --use-fp16 1 \
+    --num-epochs 10 \
+    --max-duration 200 \
+    --base-lr 1e-5 \
+    --tokenizer emilia \
+    --lang ja \
+    --token-file data/tokens_emilia_ja.txt \
+    --dataset custom \
+    --train-manifest data/ja/cuts_train.jsonl.gz \
+    --dev-manifest data/ja/cuts_dev.jsonl.gz \
+    --teacher-model exp/zipvoice_distill/iter-2000-avg-1.pt \
+    --distill-stage second \
+    --finetune 1 \
+    --freeze-decoder 1 \
+    --exp-dir exp/zipvoice_distill_ja
 """
 
 import argparse
@@ -122,6 +141,24 @@ from zipvoice.utils.lr_scheduler import FixedLRScheduler, LRScheduler
 from zipvoice.utils.optim import ScaledAdam
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
+
+
+def tokenize_text(c, tokenizer):
+    # Check for pre-computed token IDs first
+    if (
+        hasattr(c.supervisions[0], "custom")
+        and c.supervisions[0].custom
+        and "token_ids" in c.supervisions[0].custom
+    ):
+        c.supervisions[0].tokens = c.supervisions[0].custom["token_ids"]
+        return c
+    # Fall back to existing logic
+    if hasattr(c.supervisions[0], "tokens"):
+        tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
+    else:
+        tokens = tokenizer.texts_to_token_ids([c.supervisions[0].text])
+    c.supervisions[0].tokens = tokens[0]
+    return c
 
 
 def get_parser():
@@ -275,6 +312,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-bf16",
+        type=str2bool,
+        default=False,
+        help="Whether to use bfloat16 precision training. "
+        "When enabled, GradScaler is disabled as bf16 does not need loss scaling.",
+    )
+
+    parser.add_argument(
         "--feat-scale",
         type=float,
         default=0.1,
@@ -353,6 +398,20 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--finetune",
+        type=str2bool,
+        default=False,
+        help="Whether to use fine-tuning mode with AdamW and fixed LR.",
+    )
+
+    parser.add_argument(
+        "--freeze-decoder",
+        type=str2bool,
+        default=False,
+        help="Freeze fm_decoder. Train only text_encoder and embed.",
+    )
+
+    parser.add_argument(
         "--token-file",
         type=str,
         default="data/tokens_emilia.txt",
@@ -376,6 +435,93 @@ def ema(new_model, ema_model, decay):
         )
 
 
+def compute_finetune_fbank_loss(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    features: Tensor,
+    features_lens: Tensor,
+    tokens: List[List[int]],
+    is_training: bool,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute direct flow-matching loss for fine-tuning without a teacher model.
+    Uses the same loss as the base ZipVoice model (velocity matching).
+
+    Args:
+      params:
+        Parameters for training. See :func:`get_params`.
+      model:
+        The model for training (ZipVoiceDistill).
+      features:
+        The target acoustic feature.
+      features_lens:
+        The number of frames of each utterance.
+      tokens:
+        Input tokens that representing the transcripts.
+      is_training:
+        True for training. False for validation.
+    """
+
+    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+
+    batch_size, num_frames, _ = features.shape
+
+    noise = torch.randn_like(features)  # (B, T, F)
+
+    # Sampling t from uniform distribution
+    if is_training:
+        t = torch.rand(batch_size, 1, 1, device=device)
+    else:
+        t = (
+            (torch.arange(batch_size, device=device) / batch_size)
+            .unsqueeze(1)
+            .unsqueeze(2)
+        )
+
+    with torch.set_grad_enabled(is_training):
+        # Access the underlying model methods for direct flow-matching loss
+        actual_model = model.module if isinstance(model, DDP) else model
+
+        (
+            text_condition,
+            padding_mask,
+        ) = actual_model.forward_text_train(
+            tokens=tokens,
+            features_lens=features_lens,
+        )
+
+        speech_condition_mask = condition_time_mask(
+            features_lens=features_lens,
+            mask_percent=(0.7, 1.0),
+            max_len=features.size(1),
+        )
+        speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
+
+        xt = features * t + noise * (1 - t)
+        ut = features - noise  # (B, T, F)
+
+        vt = actual_model.forward_fm_decoder(
+            t=t,
+            xt=xt,
+            text_condition=text_condition,
+            speech_condition=speech_condition,
+            padding_mask=padding_mask,
+        )
+
+        loss_mask = speech_condition_mask & (~padding_mask)
+        loss = torch.mean((vt[loss_mask] - ut[loss_mask]) ** 2)
+
+    # Cast to FP32 for numerical stability during fine-tuning
+    loss = loss.float()
+
+    assert loss.requires_grad == is_training
+    info = MetricsTracker()
+    num_frames = features_lens.sum().item()
+    info["frames"] = num_frames
+    info["loss"] = loss.detach().cpu().item() * num_frames
+    return loss, info
+
+
 def compute_fbank_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -394,7 +540,7 @@ def compute_fbank_loss(
       model:
         The model for training.
       teacher_model:
-        The teacher model for distillation.
+        The teacher model for distillation. Ignored when params.finetune is True.
       features:
         The target acoustic feature.
       features_lens:
@@ -406,6 +552,17 @@ def compute_fbank_loss(
         function enables autograd during computation; when it is False, it
         disables autograd.
     """
+
+    # In fine-tuning mode, use direct flow-matching loss (no teacher needed)
+    if getattr(params, "finetune", False):
+        return compute_finetune_fbank_loss(
+            params=params,
+            model=model,
+            features=features,
+            features_lens=features_lens,
+            tokens=tokens,
+            is_training=is_training,
+        )
 
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
 
@@ -628,7 +785,13 @@ def train_one_epoch(
         )
 
         try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
+            autocast_dtype = (
+                torch.bfloat16
+                if getattr(params, "use_bf16", False)
+                else torch.float16
+            )
+            autocast_enabled = params.use_fp16 or getattr(params, "use_bf16", False)
+            with torch_autocast(dtype=autocast_dtype, enabled=autocast_enabled):
                 loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
@@ -641,13 +804,24 @@ def train_one_epoch(
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
+            # Skip NaN/Inf losses during fine-tuning
+            if getattr(params, "finetune", False) and (
+                torch.isnan(loss) or torch.isinf(loss)
+            ):
+                logging.warning(f"Skipping batch {batch_idx} due to NaN/Inf loss")
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
 
             scheduler.step_batch(params.batch_idx_train)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
-            if params.distill_stage == "second":
+            if (
+                not getattr(params, "finetune", False)
+                and params.distill_stage == "second"
+            ):
                 ema(model, teacher_model, params.ema_decay)
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
@@ -692,9 +866,10 @@ def train_one_epoch(
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
             break
         if params.batch_idx_train % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it. The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have
-            # different behavior depending on the current grad scale.
+            # If the grad scale was less than 1, try increasing it.
+            # The _growth_interval of the grad scaler is configurable,
+            # but we can't configure it to have different behavior
+            # depending on the current grad scale.
             cur_grad_scale = scaler._scale.item()
 
             if cur_grad_scale < 1024.0 or (
@@ -707,10 +882,17 @@ def train_one_epoch(
                     saved_bad_model = True
                 logging.warning(f"Grad scale is small: {cur_grad_scale}")
             if cur_grad_scale < 1.0e-05:
-                save_bad_model()
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
+                if getattr(params, "finetune", False):
+                    logging.warning(
+                        f"Grad scale very small ({cur_grad_scale}), "
+                        "resetting to 1.0"
+                    )
+                    scaler.update(1.0)
+                else:
+                    save_bad_model()
+                    raise RuntimeError(
+                        f"grad_scale is too small, exiting: {cur_grad_scale}"
+                    )
 
         if params.batch_idx_train % params.log_interval == 0:
             cur_lr = max(scheduler.get_last_lr())
@@ -722,7 +904,11 @@ def train_one_epoch(
                 f"batch size: {batch_size}, "
                 f"loss[{loss_info}], tot_loss[{tot_loss}], "
                 f"cur_lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                + (
+                    f"grad_scale: {scaler._scale.item()}"
+                    if params.use_fp16
+                    else ""
+                )
             )
 
             if tb_writer is not None:
@@ -732,7 +918,9 @@ def train_one_epoch(
                 loss_info.write_summary(
                     tb_writer, "train/current_", params.batch_idx_train
                 )
-                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
+                tot_loss.write_summary(
+                    tb_writer, "train/tot_", params.batch_idx_train
+                )
                 if params.use_fp16:
                     tb_writer.add_scalar(
                         "train/grad_scale",
@@ -757,7 +945,9 @@ def compute_validation_loss(
     """Run the validation process."""
 
     model.eval()
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = (
+        model.device if isinstance(model, DDP) else next(model.parameters()).device
+    )
 
     # used to summary the stats over iterations
     tot_loss = MetricsTracker()
@@ -804,9 +994,12 @@ def scan_pessimistic_batches_for_oom(
     from lhotse.dataset import find_pessimistic_batches
 
     logging.info(
-        "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
+        "Sanity check -- see if any of the batches in epoch 1 "
+        "would cause OOM."
     )
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = (
+        model.device if isinstance(model, DDP) else next(model.parameters()).device
+    )
 
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
@@ -819,8 +1012,9 @@ def scan_pessimistic_batches_for_oom(
             return_feature=True,
         )
         try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
-
+            with torch_autocast(
+                dtype=torch.float16, enabled=params.use_fp16
+            ):
                 loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
@@ -867,7 +1061,7 @@ def run(rank, world_size, args):
     # Set epoch to a large number to ignore it.
     if params.num_iters > 0:
         params.num_epochs = 1000000
-    with open(params.model_config, "r") as f:
+    with open(params.model_config, "r", encoding="utf-8") as f:
         model_config = json.load(f)
     params.update(model_config["model"])
     params.update(model_config["feature"])
@@ -893,16 +1087,23 @@ def run(rank, world_size, args):
     logging.info(f"Device: {params.device}")
 
     if params.tokenizer == "emilia":
-        tokenizer = EmiliaTokenizer(token_file=params.token_file, lang=params.lang)
+        tokenizer = EmiliaTokenizer(
+            token_file=params.token_file, lang=params.lang
+        )
     elif params.tokenizer == "libritts":
         tokenizer = LibriTTSTokenizer(token_file=params.token_file)
     elif params.tokenizer == "espeak":
-        tokenizer = EspeakTokenizer(token_file=params.token_file, lang=params.lang)
+        tokenizer = EspeakTokenizer(
+            token_file=params.token_file, lang=params.lang
+        )
     else:
         assert params.tokenizer == "simple"
         tokenizer = SimpleTokenizer(token_file=params.token_file)
 
-    tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
+    tokenizer_config = {
+        "vocab_size": tokenizer.vocab_size,
+        "pad_id": tokenizer.pad_id,
+    }
     params.update(tokenizer_config)
 
     logging.info(params)
@@ -915,19 +1116,30 @@ def run(rank, world_size, args):
         **model_config["model"],
         **tokenizer_config,
     )
+
+    # Use strict=False in finetune mode to handle expanded vocab
+    load_strict = (
+        (params.distill_stage == "second") and not params.finetune
+    )
     _ = load_checkpoint(
         filename=params.teacher_model,
         model=model,
-        strict=(params.distill_stage == "second"),
+        strict=load_strict,
     )
 
-    if params.distill_stage == "first":
+    if params.finetune:
+        # In fine-tuning mode, use EMA of model itself as teacher
+        # (no separate teacher needed for direct flow-matching loss)
+        teacher_model = copy.deepcopy(model)
+    elif params.distill_stage == "first":
         teacher_model = ZipVoice(
             **model_config["model"],
             **tokenizer_config,
         )
         _ = load_checkpoint(
-            filename=params.teacher_model, model=teacher_model, strict=True
+            filename=params.teacher_model,
+            model=teacher_model,
+            strict=True,
         )
     else:
         teacher_model = copy.deepcopy(model)
@@ -942,7 +1154,7 @@ def run(rank, world_size, args):
     assert params.start_epoch > 0, params.start_epoch
     if params.start_epoch > 1:
         logging.info(f"Resuming from epoch {params.start_epoch}")
-        if params.distill_stage == "first":
+        if params.finetune or params.distill_stage == "first":
             checkpoints = resume_checkpoint(
                 params=params, model=model, model_avg=model_avg
             )
@@ -958,36 +1170,68 @@ def run(rank, world_size, args):
     teacher_model.to(params.device)
     teacher_model.eval()
 
+    # Freeze decoder if requested (for language adaptation fine-tuning)
+    if params.freeze_decoder:
+        num_frozen = 0
+        num_trainable = 0
+        for name, p in model.named_parameters():
+            if "fm_decoder" in name:
+                p.requires_grad = False
+                num_frozen += p.numel()
+            else:
+                p.requires_grad = True
+                num_trainable += p.numel()
+        logging.info(
+            f"Freeze decoder: {num_trainable:,} trainable params, "
+            f"{num_frozen:,} frozen params"
+        )
+    elif not params.finetune:
+        # Default distillation behavior: only update the fm_decoder
+        num_trainable = 0
+        for name, p in model.named_parameters():
+            if "fm_decoder" in name:
+                p.requires_grad = True
+                num_trainable += p.numel()
+            else:
+                p.requires_grad = False
+
+        logging.info(
+            "A total of {} trainable parameters "
+            "({:.3f}% of the whole model)".format(
+                num_trainable, num_trainable / num_param * 100
+            )
+        )
+
     if world_size > 1:
         logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
-    # only update the fm_decoder
-    num_trainable = 0
-    for name, p in model.named_parameters():
-        if "fm_decoder" in name:
-            p.requires_grad = True
-            num_trainable += p.numel()
-        else:
-            p.requires_grad = False
-
-    logging.info(
-        "A total of {} trainable parameters ({:.3f}% of the whole model)".format(
-            num_trainable, num_trainable / num_param * 100
+        model = DDP(
+            model, device_ids=[rank], find_unused_parameters=True
         )
-    )
 
-    optimizer = ScaledAdam(
-        get_parameter_groups_with_lrs(
-            model,
+    if params.finetune:
+        trainable_params = [
+            p for p in model.parameters() if p.requires_grad
+        ]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
             lr=params.base_lr,
-            include_names=True,
-        ),
-        lr=params.base_lr,  # should have no effect
-        clipping_scale=2.0,
-    )
+            weight_decay=0.01,
+        )
+    else:
+        optimizer = ScaledAdam(
+            get_parameter_groups_with_lrs(
+                model,
+                lr=params.base_lr,
+                include_names=True,
+            ),
+            lr=params.base_lr,  # should have no effect
+            clipping_scale=2.0,
+        )
 
-    scheduler = FixedLRScheduler(optimizer)
+    if params.finetune:
+        scheduler = FixedLRScheduler(optimizer)
+    else:
+        scheduler = FixedLRScheduler(optimizer)
 
     scaler = create_grad_scaler(enabled=params.use_fp16)
 
@@ -1015,13 +1259,17 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    def remove_short_and_long_utt(c: Cut, min_len: float, max_len: float):
+    def remove_short_and_long_utt(
+        c: Cut, min_len: float, max_len: float
+    ):
         if c.duration < min_len or c.duration > max_len:
             return False
         return True
 
     _remove_short_and_long_utt = partial(
-        remove_short_and_long_utt, min_len=params.min_len, max_len=params.max_len
+        remove_short_and_long_utt,
+        min_len=params.min_len,
+        max_len=params.max_len,
     )
 
     datamodule = TtsDataModule(args)
@@ -1050,12 +1298,13 @@ def run(rank, world_size, args):
         dev_cuts = dev_cuts.filter(_remove_short_and_long_utt)
 
     if params.tokenizer in ["emilia", "espeak", "dialog"]:
-        if not hasattr(train_cuts[0].supervisions[0], "tokens") or not hasattr(
-            dev_cuts[0].supervisions[0], "tokens"
-        ):
+        if not hasattr(
+            train_cuts[0].supervisions[0], "tokens"
+        ) or not hasattr(dev_cuts[0].supervisions[0], "tokens"):
             logging.warning(
-                f"Using {params.tokenizer} tokenizer but tokens are not prepared,"
-                f"will tokenize on-the-fly, which can slow down training significantly."
+                f"Using {params.tokenizer} tokenizer but tokens "
+                "are not prepared, will tokenize on-the-fly, "
+                "which can slow down training significantly."
             )
     _tokenize_text = partial(tokenize_text, tokenizer=tokenizer)
     train_cuts = train_cuts.map(_tokenize_text)
@@ -1085,7 +1334,9 @@ def run(rank, world_size, args):
         params.cur_epoch = epoch
 
         if tb_writer is not None:
-            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+            tb_writer.add_scalar(
+                "train/epoch", epoch, params.batch_idx_train
+            )
 
         train_one_epoch(
             params=params,
@@ -1102,7 +1353,10 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
-        if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
+        if (
+            params.num_iters > 0
+            and params.batch_idx_train > params.num_iters
+        ):
             break
 
         if params.print_diagnostics:
@@ -1125,11 +1379,15 @@ def run(rank, world_size, args):
 
         if rank == 0:
             if params.best_train_epoch == params.cur_epoch:
-                best_train_filename = params.exp_dir / "best-train-loss.pt"
+                best_train_filename = (
+                    params.exp_dir / "best-train-loss.pt"
+                )
                 copyfile(src=filename, dst=best_train_filename)
 
             if params.best_valid_epoch == params.cur_epoch:
-                best_valid_filename = params.exp_dir / "best-valid-loss.pt"
+                best_valid_filename = (
+                    params.exp_dir / "best-valid-loss.pt"
+                )
                 copyfile(src=filename, dst=best_valid_filename)
 
     logging.info("Done!")
@@ -1148,7 +1406,9 @@ def main():
     world_size = args.world_size
     assert world_size >= 1
     if world_size > 1:
-        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+        mp.spawn(
+            run, args=(world_size, args), nprocs=world_size, join=True
+        )
     else:
         run(rank=0, world_size=1, args=args)
 
@@ -1156,4 +1416,11 @@ def main():
 if __name__ == "__main__":
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+
+    # CUDA performance optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
     main()

@@ -44,10 +44,13 @@ class LuxTTSConfig:
 
 
 @torch.inference_mode
-def process_audio(audio, transcriber, tokenizer, feature_extractor, device, target_rms=0.1, duration=4, feat_scale=0.1):
+def process_audio(audio, transcriber, tokenizer, feature_extractor, device, target_rms=0.1, duration=4, feat_scale=0.1, lang=None):
     prompt_wav, sr = librosa.load(audio, sr=24000, duration=duration)
     prompt_wav2, sr = librosa.load(audio, sr=16000, duration=duration)
-    prompt_text = transcriber(prompt_wav2)["text"]
+    if lang:
+        prompt_text = transcriber(prompt_wav2, generate_kwargs={"language": lang})["text"]
+    else:
+        prompt_text = transcriber(prompt_wav2)["text"]
     print(prompt_text)
 
     prompt_wav = torch.from_numpy(prompt_wav).unsqueeze(0)
@@ -103,7 +106,7 @@ def load_models_gpu(model_path=None, device="cuda", lang=None):
     tokenizer = EmiliaTokenizer(token_file=token_file, lang=lang)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
-    with open(model_config, "r") as f:
+    with open(model_config, "r", encoding="utf-8") as f:
         model_config = json.load(f)
 
     model = ZipVoiceDistill(
@@ -140,7 +143,7 @@ def load_models_cpu(model_path = None, num_thread=2, lang=None):
     tokenizer = EmiliaTokenizer(token_file=token_file, lang=lang)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
-    with open(model_config, "r") as f:
+    with open(model_config, "r", encoding="utf-8") as f:
         model_config = json.load(f)
 
     model = OnnxModel(text_encoder_path, fm_decoder_path, num_thread=num_thread)
