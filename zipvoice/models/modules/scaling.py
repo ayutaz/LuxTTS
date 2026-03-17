@@ -371,10 +371,13 @@ class BiasNormFunction(torch.autograd.Function):
         ctx.channel_dim = channel_dim
         for _ in range(channel_dim + 1, x.ndim):
             bias = bias.unsqueeze(-1)
-        scales = (
-            torch.mean((x - bias) ** 2, dim=channel_dim, keepdim=True) ** -0.5
-        ) * log_scale.exp()
-        ans = x * scales
+        with torch.amp.autocast('cuda', enabled=False):
+            x_float = x.float()
+            bias_float = bias.float()
+            scales = (
+                torch.mean((x_float - bias_float) ** 2, dim=channel_dim, keepdim=True).clamp(min=1e-8) ** -0.5
+            ) * log_scale.float().exp()
+        ans = x * scales.to(x.dtype)
         ctx.save_for_backward(
             ans.detach() if store_output_for_backprop else x,
             scales.detach(),
@@ -396,11 +399,15 @@ class BiasNormFunction(torch.autograd.Function):
         log_scale.requires_grad = True
         with torch.enable_grad():
             # recompute scales from x, bias and log_scale.
-            scales = (
-                torch.mean((x - bias) ** 2, dim=ctx.channel_dim, keepdim=True) ** -0.5
-            ) * log_scale.exp()
+            with torch.amp.autocast('cuda', enabled=False):
+                x = x.float()
+                bias = bias.float()
+                log_scale = log_scale.float()
+                scales = (
+                    torch.mean((x - bias) ** 2, dim=ctx.channel_dim, keepdim=True).clamp(min=1e-8) ** -0.5
+                ) * log_scale.exp()
             ans = x * scales
-            ans.backward(gradient=ans_grad)
+            ans.backward(gradient=ans_grad.float())
         return x.grad, bias.grad.flatten(), log_scale.grad, None, None
 
 
@@ -556,8 +563,8 @@ class BalancerFunction(torch.autograd.Function):
                     mean_dims = [i for i in range(x.ndim) if i != channel_dim]
                     uncentered_var = (x**2).mean(dim=mean_dims, keepdim=True)
                     mean = x.mean(dim=mean_dims, keepdim=True)
-                    stddev = (uncentered_var - (mean * mean)).clamp(min=1.0e-20).sqrt()
-                    rms = uncentered_var.clamp(min=1.0e-20).sqrt()
+                    stddev = (uncentered_var - (mean * mean)).clamp(min=1.0e-6).sqrt()
+                    rms = uncentered_var.clamp(min=1.0e-6).sqrt()
 
                     m = mean / stddev
                     # part of loss that relates to mean / stddev
@@ -1203,9 +1210,8 @@ class SwooshROnnx(torch.nn.Module):
 def SwooshLForward(x: Tensor):
     with torch.amp.autocast(DEVICE_TYPE, enabled=False):
         x = x.to(torch.float32)
-        x_offset = x - 4.0
-        log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
-        log_sum = torch.where(log_sum == float("inf"), x_offset, log_sum)
+        zero = torch.zeros(1, dtype=x.dtype, device=x.device)
+        log_sum = torch.logaddexp(zero, x - 4.0)
         return log_sum - 0.08 * x - 0.035
 
 
@@ -1214,9 +1220,8 @@ def SwooshLForward(x: Tensor):
 def SwooshRForward(x: Tensor):
     with torch.amp.autocast(DEVICE_TYPE, enabled=False):
         x = x.to(torch.float32)
-        x_offset = x - 1.0
-        log_sum = (1.0 + x_offset.exp()).log().to(x.dtype)
-        log_sum = torch.where(log_sum == float("inf"), x_offset, log_sum)
+        zero = torch.zeros(1, dtype=x.dtype, device=x.device)
+        log_sum = torch.logaddexp(zero, x - 1.0)
         return log_sum - 0.08 * x - 0.313261687
 
 

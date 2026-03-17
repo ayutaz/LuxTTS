@@ -481,7 +481,7 @@ def compute_finetune_fbank_loss(
         t = torch.rand(batch_size, 1, 1, device=device)
     else:
         t = (
-            (torch.arange(batch_size, device=device) / batch_size)
+            ((torch.arange(batch_size, device=device) + 0.5) / batch_size)
             .unsqueeze(1)
             .unsqueeze(2)
         )
@@ -504,6 +504,14 @@ def compute_finetune_fbank_loss(
             max_len=features.size(1),
         )
         speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
+
+        # Apply condition dropout (critical for preventing overfitting)
+        if is_training and getattr(params, 'condition_drop_ratio', 0.2) > 0.0:
+            drop_mask = (
+                torch.rand(text_condition.size(0), 1, 1).to(text_condition.device)
+                > getattr(params, 'condition_drop_ratio', 0.2)
+            )
+            text_condition = text_condition * drop_mask
 
         xt = features * t + noise * (1 - t)
         ut = features - noise  # (B, T, F)

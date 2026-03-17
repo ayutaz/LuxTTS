@@ -534,7 +534,7 @@ def compute_fbank_loss(
         t = torch.rand(batch_size, 1, 1, device=device)
     else:
         t = (
-            (torch.arange(batch_size, device=device) / batch_size)
+            ((torch.arange(batch_size, device=device) + 0.5) / batch_size)
             .unsqueeze(1)
             .unsqueeze(2)
         )
