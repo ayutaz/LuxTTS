@@ -58,6 +58,7 @@ from torch.utils.tensorboard import SummaryWriter
 import zipvoice.utils.diagnostics as diagnostics
 from zipvoice.dataset.datamodule import TtsDataModule
 from zipvoice.models.zipvoice import ZipVoice
+from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import (
     EmiliaTokenizer,
     EspeakTokenizer,
@@ -210,6 +211,21 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--freeze-decoder",
+        type=str2bool,
+        default=False,
+        help="Freeze the fm_decoder during fine-tuning. Only text_encoder and embed are trained. "
+        "Recommended for language adaptation (e.g., Japanese fine-tuning).",
+    )
+
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation steps. Effective batch size = grad_accum_steps * max_duration.",
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -273,7 +289,7 @@ def get_parser():
     parser.add_argument(
         "--average-period",
         type=int,
-        default=200,
+        default=500,
         help="""Update the averaged model, namely `model_avg`, after processing
         this number of batches. `model_avg` is a separate version of model,
         in which each floating-point parameter is the average of all the
@@ -288,6 +304,14 @@ def get_parser():
         type=str2bool,
         default=True,
         help="Whether to use half precision training.",
+    )
+
+    parser.add_argument(
+        "--use-bf16",
+        type=str2bool,
+        default=False,
+        help="Use BF16 mixed precision instead of FP16. More numerically stable, "
+        "recommended for fine-tuning on RTX 3090/4090.",
     )
 
     parser.add_argument(
@@ -370,6 +394,14 @@ def get_parser():
         "which is a text file with '{token}\t{token_id}' per line.",
     )
 
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="zipvoice",
+        choices=["zipvoice", "zipvoice_distill"],
+        help="Model architecture to use. Use 'zipvoice_distill' when fine-tuning from the pretrained distilled model.",
+    )
+
     return parser
 
 
@@ -414,7 +446,7 @@ def get_params() -> AttributeDict:
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
-            "log_interval": 50,
+            "log_interval": 100,
             "reset_interval": 200,
             "env_info": get_env_info(),
         }
@@ -477,11 +509,14 @@ def compute_fbank_loss(
             condition_drop_ratio=params.condition_drop_ratio,
         )
 
+    # Cast to FP32 for numerical stability during fine-tuning
+    loss = loss.float()
+
     assert loss.requires_grad == is_training
     info = MetricsTracker()
     num_frames = features_lens.sum().item()
     info["frames"] = num_frames
-    info["loss"] = loss.detach().cpu().item() * num_frames
+    info["loss"] = loss.detach().item() * num_frames
 
     return loss, info
 
@@ -551,7 +586,7 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(train_dl):
 
-        if batch_idx % 10 == 0:
+        if batch_idx % 100 == 0:
             if params.finetune:
                 set_batch_count(model, get_adjusted_batch_count(params) + 100000)
             else:
@@ -598,7 +633,9 @@ def train_one_epoch(
         )
 
         try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
+            autocast_dtype = torch.bfloat16 if params.use_bf16 else torch.float16
+            autocast_enabled = params.use_fp16 or params.use_bf16
+            with torch_autocast(dtype=autocast_dtype, enabled=autocast_enabled):
                 loss, loss_info = compute_fbank_loss(
                     params=params,
                     model=model,
@@ -616,20 +653,22 @@ def train_one_epoch(
                 optimizer.zero_grad()
                 continue
 
-            scaler.scale(loss).backward()
+            scaled_loss = loss / params.grad_accum_steps
+            scaler.scale(scaled_loss).backward()
 
-            scheduler.step_batch(params.batch_idx_train)
-            # Use the number of hours of speech to adjust the learning rate
-            if params.lr_hours > 0:
-                scheduler.step_epoch(
-                    params.batch_idx_train
-                    * params.max_duration
-                    * params.world_size
-                    / 3600
-                )
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+            if (batch_idx + 1) % params.grad_accum_steps == 0:
+                scheduler.step_batch(params.batch_idx_train)
+                # Use the number of hours of speech to adjust the learning rate
+                if params.lr_hours > 0:
+                    scheduler.step_epoch(
+                        params.batch_idx_train
+                        * params.max_duration
+                        * params.world_size
+                        / 3600
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
         except Exception as e:
             logging.info(f"Caught exception : {e}.")
             save_bad_model()
@@ -672,7 +711,7 @@ def train_one_epoch(
             )
         if params.num_iters > 0 and params.batch_idx_train > params.num_iters:
             break
-        if params.batch_idx_train % 100 == 0 and params.use_fp16:
+        if params.batch_idx_train % 100 == 0 and params.use_fp16 and not params.use_bf16:
             # If the grad scale was less than 1, try increasing it. The _growth_interval
             # of the grad scaler is configurable, but we can't configure it to have
             # different behavior depending on the current grad scale.
@@ -688,10 +727,14 @@ def train_one_epoch(
                     saved_bad_model = True
                 logging.warning(f"Grad scale is small: {cur_grad_scale}")
             if cur_grad_scale < 1.0e-05:
-                save_bad_model()
-                raise RuntimeError(
-                    f"grad_scale is too small, exiting: {cur_grad_scale}"
-                )
+                if params.finetune:
+                    logging.warning(f"Grad scale very small ({cur_grad_scale}), resetting to 1.0")
+                    scaler.update(1.0)
+                else:
+                    save_bad_model()
+                    raise RuntimeError(
+                        f"grad_scale is too small, exiting: {cur_grad_scale}"
+                    )
 
         if params.batch_idx_train % params.log_interval == 0:
             cur_lr = max(scheduler.get_last_lr())
@@ -826,7 +869,9 @@ def scan_pessimistic_batches_for_oom(
             return_feature=True,
         )
         try:
-            with torch_autocast(dtype=torch.float16, enabled=params.use_fp16):
+            autocast_dtype = torch.bfloat16 if params.use_bf16 else torch.float16
+            autocast_enabled = params.use_fp16 or params.use_bf16
+            with torch_autocast(dtype=autocast_dtype, enabled=autocast_enabled):
 
                 loss, loss_info = compute_fbank_loss(
                     params=params,
@@ -924,10 +969,16 @@ def run(rank, world_size, args):
 
     logging.info("About to create model")
 
-    model = ZipVoice(
-        **model_config["model"],
-        **tokenizer_config,
-    )
+    if params.model_name == "zipvoice_distill":
+        model = ZipVoiceDistill(
+            **model_config["model"],
+            **tokenizer_config,
+        )
+    else:
+        model = ZipVoice(
+            **model_config["model"],
+            **tokenizer_config,
+        )
 
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
@@ -945,13 +996,30 @@ def run(rank, world_size, args):
         checkpoints = resume_checkpoint(params=params, model=model, model_avg=model_avg)
 
     model = model.to(params.device)
+
+    if params.freeze_decoder:
+        num_frozen = 0
+        num_trainable = 0
+        for name, p in model.named_parameters():
+            if "fm_decoder" in name:
+                p.requires_grad = False
+                num_frozen += p.numel()
+            else:
+                p.requires_grad = True
+                num_trainable += p.numel()
+        logging.info(
+            f"Freeze decoder: {num_trainable:,} trainable params, "
+            f"{num_frozen:,} frozen params"
+        )
+
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     if params.finetune:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
-            model.parameters(),
+            trainable_params,
             lr=params.base_lr,
             weight_decay=0.01,
         )
@@ -975,7 +1043,7 @@ def run(rank, world_size, args):
     else:
         scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
-    scaler = create_grad_scaler(enabled=params.use_fp16)
+    scaler = create_grad_scaler(enabled=params.use_fp16 and not params.use_bf16)
 
     if params.start_epoch > 1 and checkpoints is not None:
         # load state_dict for optimizers
@@ -1141,4 +1209,11 @@ def main():
 if __name__ == "__main__":
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
+
+    # CUDA performance optimizations
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+
     main()

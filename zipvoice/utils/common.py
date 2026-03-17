@@ -239,8 +239,8 @@ def prepare_input(
         return_list += [batch["tokens"]]
 
     if return_feature:
-        features = batch["features"].to(device)
-        features_lens = batch["features_lens"].to(device)
+        features = batch["features"].to(device, non_blocking=True)
+        features_lens = batch["features_lens"].to(device, non_blocking=True)
         return_list += [features * params.feat_scale, features_lens]
 
     if return_audio:

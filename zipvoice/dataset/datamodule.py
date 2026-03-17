@@ -116,7 +116,7 @@ class TtsDataModule:
         group.add_argument(
             "--num-workers",
             type=int,
-            default=4,
+            default=8,
             help="Number of DataLoader worker processes.",
         )
 
@@ -227,6 +227,8 @@ class TtsDataModule:
             batch_size=None,
             num_workers=self.args.num_workers,
             persistent_workers=(self.args.num_workers > 0),
+            pin_memory=True,
+            prefetch_factor=4 if self.args.num_workers > 0 else None,
         )
         return dl
 
@@ -244,5 +246,7 @@ class TtsDataModule:
             batch_size=None,
             num_workers=self.args.num_workers,
             persistent_workers=(self.args.num_workers > 0),
+            pin_memory=True,
+            prefetch_factor=4 if self.args.num_workers > 0 else None,
         )
         return dl
