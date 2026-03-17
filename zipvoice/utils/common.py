@@ -250,11 +250,11 @@ def prepare_input(
 
 
 def prepare_avg_tokens_durations(features_lens, tokens_lens):
-    tokens_durations = []
-    for i in range(len(features_lens)):
-        utt_duration = features_lens[i]
-        avg_token_duration = utt_duration // tokens_lens[i]
-        tokens_durations.append([avg_token_duration] * tokens_lens[i])
+    avg_durations = features_lens // tokens_lens
+    tokens_durations = [
+        [int(avg_durations[i])] * int(tokens_lens[i])
+        for i in range(len(features_lens))
+    ]
     return tokens_durations
 
 
@@ -293,11 +293,12 @@ def get_tokens_index(durations: List[List[int]], num_frames: int) -> torch.Tenso
     ans = torch.zeros(batch_size, num_frames, dtype=torch.int64)
     for b in range(batch_size):
         this_dur = durations[b]
-        cur_frame = 0
-        for i, d in enumerate(this_dur):
-            ans[b, cur_frame : cur_frame + d] = i
-            cur_frame += d
-        assert cur_frame == num_frames, (cur_frame, num_frames)
+        if not this_dur:
+            continue
+        dur_tensor = torch.tensor(this_dur, dtype=torch.int64)
+        indices = torch.repeat_interleave(torch.arange(len(this_dur)), dur_tensor)
+        assert len(indices) == num_frames, (len(indices), num_frames)
+        ans[b, :len(indices)] = indices
     return ans
 
 

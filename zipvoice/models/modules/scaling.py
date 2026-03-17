@@ -324,7 +324,7 @@ class SoftmaxFunction(torch.autograd.Function):
         # (presumably) that op does not support float16, and autocast
         # is enabled.
         if torch.is_autocast_enabled():
-            ans = ans.to(torch.float16)
+            ans = ans.to(x.dtype)
         ctx.save_for_backward(ans)
         ctx.x_dtype = x.dtype
         ctx.dim = dim
@@ -778,7 +778,7 @@ def _whitening_metric(x: Tensor, num_groups: int):
         Returns a scalar Tensor that will be 1.0 if the data is "perfectly white" and
     greater than 1.0 otherwise.
     """
-    assert x.dtype != torch.float16
+    assert x.dtype not in (torch.float16, torch.bfloat16)
     x = x.reshape(-1, x.shape[-1])
     (num_frames, num_channels) = x.shape
     assert num_channels % num_groups == 0
@@ -1053,7 +1053,7 @@ class SwooshLFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: Tensor) -> Tensor:
         requires_grad = x.requires_grad
-        if x.dtype == torch.float16:
+        if x.dtype in (torch.float16, torch.bfloat16):
             x = x.to(torch.float32)
 
         zero = torch.tensor(0.0, dtype=x.dtype, device=x.device)
@@ -1085,8 +1085,8 @@ class SwooshLFunction(torch.autograd.Function):
 
                 d_int = d_scaled.to(torch.uint8)
                 ctx.save_for_backward(d_int)
-                if x.dtype == torch.float16 or torch.is_autocast_enabled():
-                    y = y.to(torch.float16)
+                if x.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled():
+                    y = y.to(x.dtype)
                 return y
 
     @staticmethod
@@ -1133,7 +1133,7 @@ class SwooshRFunction(torch.autograd.Function):
     def forward(ctx, x: Tensor) -> Tensor:
         requires_grad = x.requires_grad
 
-        if x.dtype == torch.float16:
+        if x.dtype in (torch.float16, torch.bfloat16):
             x = x.to(torch.float32)
 
         zero = torch.tensor(0.0, dtype=x.dtype, device=x.device)
@@ -1162,8 +1162,8 @@ class SwooshRFunction(torch.autograd.Function):
 
                 d_int = d_scaled.to(torch.uint8)
                 ctx.save_for_backward(d_int)
-                if x.dtype == torch.float16 or torch.is_autocast_enabled():
-                    y = y.to(torch.float16)
+                if x.dtype in (torch.float16, torch.bfloat16) or torch.is_autocast_enabled():
+                    y = y.to(x.dtype)
                 return y
 
     @staticmethod

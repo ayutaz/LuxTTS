@@ -204,6 +204,60 @@ class FixedLRScheduler(LRScheduler):
         return [x for x in self.base_lrs]
 
 
+class WarmupFixedLRScheduler(LRScheduler):
+    """
+    Learning rate scheduler with linear warmup followed by a fixed learning rate.
+
+    During the warmup phase (batch < warmup_batches), the learning rate linearly
+    increases from start_factor * base_lr to base_lr. After warmup, the learning
+    rate stays constant at base_lr.
+
+    This is designed for fine-tuning mode to help prevent early NaN issues by
+    gradually ramping up the learning rate.
+
+    Args:
+        optimizer: the optimizer to change the learning rates on
+        warmup_batches: number of batches over which to linearly warm up
+        start_factor: initial lr multiplier at batch 0 (default 0.01)
+        verbose: if True, print lr updates
+    """
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup_batches: int,
+        start_factor: float = 0.01,
+        verbose: bool = False,
+    ):
+        assert warmup_batches > 0, f"warmup_batches must be > 0, got {warmup_batches}"
+        assert 0.0 < start_factor <= 1.0, f"start_factor must be in (0, 1], got {start_factor}"
+        self.warmup_batches = warmup_batches
+        self.start_factor = start_factor
+        super(WarmupFixedLRScheduler, self).__init__(optimizer, verbose)
+
+    def get_lr(self):
+        if self.batch >= self.warmup_batches:
+            factor = 1.0
+        else:
+            factor = self.start_factor + (1.0 - self.start_factor) * (
+                self.batch / self.warmup_batches
+            )
+        return [x * factor for x in self.base_lrs]
+
+    def state_dict(self):
+        state = super().state_dict()
+        state["warmup_batches"] = self.warmup_batches
+        state["start_factor"] = self.start_factor
+        return state
+
+    def load_state_dict(self, state_dict):
+        warmup_batches = state_dict.pop("warmup_batches", self.warmup_batches)
+        start_factor = state_dict.pop("start_factor", self.start_factor)
+        super().load_state_dict(state_dict)
+        self.warmup_batches = warmup_batches
+        self.start_factor = start_factor
+
+
 def _test_eden():
     m = torch.nn.Linear(100, 100)
     from zipvoice.utils.optim import ScaledAdam

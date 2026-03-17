@@ -25,6 +25,7 @@ import random
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 if torch.cuda.is_available():
@@ -134,8 +135,10 @@ class TTSZipformer(nn.Module):
         use_guidance_scale_embed: bool = False,
         guidance_scale_embed_dim: int = 192,
         use_conv: bool = True,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super(TTSZipformer, self).__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         if dropout is None:
             dropout = ScheduledFloat((0.0, 0.3), (20000.0, 0.1))
@@ -215,6 +218,7 @@ class TTSZipformer(nn.Module):
                 warmup_begin=warmup_batches * (i + 1) / (num_encoders + 1),
                 warmup_end=warmup_batches * (i + 2) / (num_encoders + 1),
                 final_layerdrop_rate=0.035 * (downsampling_factor[i] ** 0.5),
+                use_gradient_checkpointing=use_gradient_checkpointing,
             )
 
             if downsampling_factor[i] != 1:
@@ -675,8 +679,10 @@ class Zipformer2Encoder(nn.Module):
         warmup_end: float,
         initial_layerdrop_rate: float = 0.5,
         final_layerdrop_rate: float = 0.05,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
         self.encoder_pos = CompactRelPositionalEncoding(
             pos_dim, dropout_rate=0.15, length_factor=1.0
         )
@@ -740,13 +746,24 @@ class Zipformer2Encoder(nn.Module):
         output = src
 
         for i, mod in enumerate(self.layers):
-            output = mod(
-                output,
-                pos_emb,
-                time_emb=time_emb,
-                attn_mask=attn_mask,
-                src_key_padding_mask=src_key_padding_mask,
-            )
+            if self.use_gradient_checkpointing and self.training:
+                output = torch.utils.checkpoint.checkpoint(
+                    mod,
+                    output,
+                    pos_emb,
+                    time_emb=time_emb,
+                    attn_mask=attn_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                    use_reentrant=False,
+                )
+            else:
+                output = mod(
+                    output,
+                    pos_emb,
+                    time_emb=time_emb,
+                    attn_mask=attn_mask,
+                    src_key_padding_mask=src_key_padding_mask,
+                )
 
         return output
 

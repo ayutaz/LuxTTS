@@ -119,6 +119,12 @@ class TtsDataModule:
             default=8,
             help="Number of DataLoader worker processes.",
         )
+        group.add_argument(
+            "--prefetch-factor",
+            type=int,
+            default=8,
+            help="Number of batches to prefetch per DataLoader worker.",
+        )
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -228,7 +234,7 @@ class TtsDataModule:
             num_workers=self.args.num_workers,
             persistent_workers=(self.args.num_workers > 0),
             pin_memory=True,
-            prefetch_factor=4 if self.args.num_workers > 0 else None,
+            prefetch_factor=self.args.prefetch_factor if self.args.num_workers > 0 else None,
         )
         return dl
 
@@ -247,6 +253,6 @@ class TtsDataModule:
             num_workers=self.args.num_workers,
             persistent_workers=(self.args.num_workers > 0),
             pin_memory=True,
-            prefetch_factor=4 if self.args.num_workers > 0 else None,
+            prefetch_factor=self.args.prefetch_factor if self.args.num_workers > 0 else None,
         )
         return dl

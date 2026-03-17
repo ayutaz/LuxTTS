@@ -90,7 +90,7 @@ from zipvoice.utils.common import (
     torch_autocast,
 )
 from zipvoice.utils.hooks import register_inf_check_hooks
-from zipvoice.utils.lr_scheduler import Eden, FixedLRScheduler, LRScheduler
+from zipvoice.utils.lr_scheduler import Eden, FixedLRScheduler, LRScheduler, WarmupFixedLRScheduler
 from zipvoice.utils.optim import ScaledAdam
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, LRScheduler]
@@ -219,10 +219,26 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--freeze-text-encoder-epochs",
+        type=int,
+        default=0,
+        help="Number of epochs to freeze text_encoder (train only embed layer). "
+        "After these epochs, text_encoder is unfrozen. Set to 0 to disable.",
+    )
+
+    parser.add_argument(
         "--grad-accum-steps",
         type=int,
         default=1,
         help="Number of gradient accumulation steps. Effective batch size = grad_accum_steps * max_duration.",
+    )
+
+    parser.add_argument(
+        "--warmup-batches",
+        type=int,
+        default=0,
+        help="Number of warmup batches for fine-tuning. LR linearly increases from 0 to base_lr. "
+        "Helps prevent early NaN issues. Only used with --finetune mode.",
     )
 
     parser.add_argument(
@@ -400,6 +416,30 @@ def get_parser():
         default="zipvoice",
         choices=["zipvoice", "zipvoice_distill"],
         help="Model architecture to use. Use 'zipvoice_distill' when fine-tuning from the pretrained distilled model.",
+    )
+
+    parser.add_argument(
+        "--gradient-checkpointing",
+        type=str2bool,
+        default=False,
+        help="Enable gradient checkpointing in Zipformer encoder layers to reduce "
+        "GPU memory usage at the cost of slower training.",
+    )
+
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop training if validation loss doesn't improve for this many epochs. 0 to disable.",
+    )
+
+    parser.add_argument(
+        "--curriculum-max-lens",
+        type=str,
+        default="",
+        help="Comma-separated max utterance lengths per epoch for curriculum learning. "
+        "E.g., '8,15,30' means epoch 1 uses max 8s, epoch 2 max 15s, epoch 3+ max 30s. "
+        "Empty string disables curriculum learning.",
     )
 
     return parser
@@ -901,6 +941,11 @@ def scan_pessimistic_batches_for_oom(
 
 
 def tokenize_text(c: Cut, tokenizer):
+    # Check for pre-computed token IDs first
+    if hasattr(c.supervisions[0], 'custom') and c.supervisions[0].custom and 'token_ids' in c.supervisions[0].custom:
+        c.supervisions[0].tokens = c.supervisions[0].custom['token_ids']
+        return c
+    # Fall back to existing logic
     if hasattr(c.supervisions[0], "tokens"):
         tokens = tokenizer.tokens_to_token_ids([c.supervisions[0].tokens])
     else:
@@ -983,6 +1028,13 @@ def run(rank, world_size, args):
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
         _ = load_checkpoint(filename=params.checkpoint, model=model, strict=False)
+
+    if params.gradient_checkpointing:
+        for name, module in model.named_modules():
+            if hasattr(module, 'use_gradient_checkpointing'):
+                module.use_gradient_checkpointing = True
+        logging.info("Gradient checkpointing enabled")
+
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
@@ -1012,6 +1064,15 @@ def run(rank, world_size, args):
             f"{num_frozen:,} frozen params"
         )
 
+    if params.freeze_text_encoder_epochs > 0:
+        for name, p in model.named_parameters():
+            if "text_encoder" in name:
+                p.requires_grad = False
+        logging.info(
+            f"Stage 1: text_encoder frozen for first {params.freeze_text_encoder_epochs} epochs. "
+            f"Only embed layer is trainable."
+        )
+
     if world_size > 1:
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
@@ -1037,7 +1098,19 @@ def run(rank, world_size, args):
     assert params.lr_hours >= 0
 
     if params.finetune:
-        scheduler = FixedLRScheduler(optimizer)
+        if params.warmup_batches > 0:
+            scheduler = WarmupFixedLRScheduler(
+                optimizer,
+                warmup_batches=params.warmup_batches,
+                start_factor=0.01,
+            )
+            logging.info(
+                f"Fine-tuning with warmup: LR will linearly increase from "
+                f"{params.base_lr * 0.01:.2e} to {params.base_lr:.2e} "
+                f"over {params.warmup_batches} batches."
+            )
+        else:
+            scheduler = FixedLRScheduler(optimizer)
     elif params.lr_hours > 0:
         scheduler = Eden(optimizer, params.lr_batches, params.lr_hours)
     else:
@@ -1069,14 +1142,18 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    def remove_short_and_long_utt(c: Cut, min_len: float, max_len: float):
-        if c.duration < min_len or c.duration > max_len:
+    # Store the original max_len for curriculum learning restore
+    params.original_max_len = params.max_len
+
+    def remove_short_and_long_utt(c: Cut):
+        # Read min_len and max_len from params directly so that curriculum
+        # learning can adjust max_len per epoch and the lazy filter picks
+        # up the updated value.
+        if c.duration < params.min_len or c.duration > params.max_len:
             return False
         return True
 
-    _remove_short_and_long_utt = partial(
-        remove_short_and_long_utt, min_len=params.min_len, max_len=params.max_len
-    )
+    _remove_short_and_long_utt = remove_short_and_long_utt
 
     datamodule = TtsDataModule(args)
     if params.dataset == "emilia":
@@ -1132,6 +1209,29 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         logging.info(f"Start epoch {epoch}")
 
+        # Curriculum learning: gradually increase max utterance length
+        if params.curriculum_max_lens:
+            max_lens = [float(x) for x in params.curriculum_max_lens.split(",")]
+            curriculum_idx = min(epoch - 1, len(max_lens) - 1)
+            cur_max_len = max_lens[curriculum_idx]
+            params.max_len = cur_max_len
+            logging.info(f"Curriculum learning: max utterance length = {cur_max_len}s")
+        else:
+            # Ensure max_len is the original value when curriculum is disabled
+            params.max_len = params.original_max_len
+
+        # Unfreeze text_encoder after specified epochs
+        if params.freeze_text_encoder_epochs > 0 and epoch == params.freeze_text_encoder_epochs + 1:
+            for name, p in model.named_parameters():
+                if "text_encoder" in name:
+                    p.requires_grad = True
+            # Update optimizer to include newly unfrozen params
+            if params.finetune:
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                optimizer = torch.optim.AdamW(trainable_params, lr=params.base_lr, weight_decay=0.01)
+                scheduler = FixedLRScheduler(optimizer)
+            logging.info(f"Epoch {epoch}: Unfroze text_encoder. Now training embed + text_encoder.")
+
         if params.lr_hours == 0:
             scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1184,6 +1284,15 @@ def run(rank, world_size, args):
             if params.best_valid_epoch == params.cur_epoch:
                 best_valid_filename = params.exp_dir / "best-valid-loss.pt"
                 copyfile(src=filename, dst=best_valid_filename)
+
+        if params.early_stopping_patience > 0:
+            epochs_without_improvement = epoch - params.best_valid_epoch
+            if epochs_without_improvement >= params.early_stopping_patience:
+                logging.info(
+                    f"Early stopping: no improvement for {epochs_without_improvement} epochs. "
+                    f"Best valid loss: {params.best_valid_loss:.5f} at epoch {params.best_valid_epoch}"
+                )
+                break
 
     logging.info("Done!")
 

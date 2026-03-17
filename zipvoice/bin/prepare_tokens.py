@@ -9,7 +9,7 @@ from pathlib import Path
 
 from lhotse import load_manifest, split_parallelize_combine
 
-from zipvoice.tokenizer.tokenizer import add_tokens
+from zipvoice.tokenizer.tokenizer import add_tokens, add_token_ids
 
 
 def get_args():
@@ -52,6 +52,21 @@ def get_args():
         "so that CJK characters are treated as Japanese instead of Chinese.",
     )
 
+    parser.add_argument(
+        "--token-file",
+        type=str,
+        default=None,
+        help="Path to the token file for converting tokens to IDs. "
+        "Required when --store-ids is set.",
+    )
+
+    parser.add_argument(
+        "--store-ids",
+        action="store_true",
+        default=False,
+        help="When set, store pre-computed token IDs instead of string tokens.",
+    )
+
     return parser.parse_args()
 
 
@@ -61,6 +76,8 @@ def prepare_tokens(
     num_jobs: int,
     tokenizer: str,
     lang: str = "en-us",
+    token_file: str = None,
+    store_ids: bool = False,
 ):
     logging.info(f"Processing {input_file}")
     if output_file.is_file():
@@ -69,12 +86,17 @@ def prepare_tokens(
     logging.info(f"loading manifest from {input_file}")
     cut_set = load_manifest(input_file)
 
-    _add_tokens = partial(add_tokens, tokenizer=tokenizer, lang=lang)
-
-    logging.info("Adding tokens")
+    if store_ids:
+        logging.info("Adding pre-computed token IDs")
+        _add_fn = partial(
+            add_token_ids, tokenizer=tokenizer, lang=lang, token_file=token_file
+        )
+    else:
+        _add_fn = partial(add_tokens, tokenizer=tokenizer, lang=lang)
+        logging.info("Adding tokens")
 
     cut_set = split_parallelize_combine(
-        num_jobs=num_jobs, manifest=cut_set, fn=_add_tokens
+        num_jobs=num_jobs, manifest=cut_set, fn=_add_fn
     )
 
     logging.info(f"Saving file to {output_file}")
@@ -91,6 +113,8 @@ if __name__ == "__main__":
     num_jobs = args.num_jobs
     tokenizer = args.tokenizer
     lang = args.lang
+    token_file = args.token_file
+    store_ids = args.store_ids
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +124,8 @@ if __name__ == "__main__":
         num_jobs=num_jobs,
         tokenizer=tokenizer,
         lang=lang,
+        token_file=token_file,
+        store_ids=store_ids,
     )
 
     logging.info("Done!")

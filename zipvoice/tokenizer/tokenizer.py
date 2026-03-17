@@ -692,6 +692,29 @@ def add_tokens(cut_set: CutSet, tokenizer: str, lang: str):
     return cut_set
 
 
+def add_token_ids(cut_set: CutSet, tokenizer: str, lang: str, token_file: str = None):
+    """Add pre-computed token IDs to cuts (avoids per-batch tokenization)."""
+    if tokenizer == "emilia":
+        tok = EmiliaTokenizer(token_file=token_file, lang=lang)
+    elif tokenizer == "espeak":
+        tok = EspeakTokenizer(token_file=token_file, lang=lang)
+    elif tokenizer == "dialog":
+        tok = DialogTokenizer(token_file=token_file, lang=lang)
+    elif tokenizer == "libritts":
+        tok = LibriTTSTokenizer(token_file=token_file)
+    else:
+        tok = SimpleTokenizer(token_file=token_file)
+
+    def _prepare_cut(cut):
+        text = cut.supervisions[0].text
+        token_ids = tok.texts_to_token_ids([text])[0]
+        cut.supervisions[0].custom = cut.supervisions[0].custom or {}
+        cut.supervisions[0].custom["token_ids"] = token_ids
+        return cut
+
+    return cut_set.map(_prepare_cut)
+
+
 if __name__ == "__main__":
     text = (
         "我们是5年小米人,是吗? Yes I think so! "
