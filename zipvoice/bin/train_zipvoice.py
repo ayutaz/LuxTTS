@@ -610,6 +610,12 @@ def train_one_epoch(
 
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
+            # Skip NaN losses during fine-tuning
+            if params.finetune and (torch.isnan(loss) or torch.isinf(loss)):
+                logging.warning(f"Skipping batch {batch_idx} due to NaN/Inf loss")
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
 
             scheduler.step_batch(params.batch_idx_train)
@@ -925,7 +931,7 @@ def run(rank, world_size, args):
 
     if params.checkpoint is not None:
         logging.info(f"Loading pre-trained model from {params.checkpoint}")
-        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=True)
+        _ = load_checkpoint(filename=params.checkpoint, model=model, strict=False)
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of parameters : {num_param}")
 
@@ -943,15 +949,22 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    optimizer = ScaledAdam(
-        get_parameter_groups_with_lrs(
-            model,
+    if params.finetune:
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
             lr=params.base_lr,
-            include_names=True,
-        ),
-        lr=params.base_lr,  # should have no effect
-        clipping_scale=2.0,
-    )
+            weight_decay=0.01,
+        )
+    else:
+        optimizer = ScaledAdam(
+            get_parameter_groups_with_lrs(
+                model,
+                lr=params.base_lr,
+                include_names=True,
+            ),
+            lr=params.base_lr,  # should have no effect
+            clipping_scale=2.0,
+        )
 
     assert params.lr_hours >= 0
 
