@@ -218,6 +218,14 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Student model checkpoint (e.g., with expanded vocab). "
+        "If not provided, student loads from --teacher-model.",
+    )
+
+    parser.add_argument(
         "--exp-dir",
         type=str,
         default="exp/zipvoice_distill",
@@ -1117,12 +1125,12 @@ def run(rank, world_size, args):
         **tokenizer_config,
     )
 
-    # Use strict=False in finetune mode to handle expanded vocab
-    load_strict = (
-        (params.distill_stage == "second") and not params.finetune
-    )
+    # Load student model weights
+    student_ckpt = params.checkpoint if params.checkpoint else params.teacher_model
+    load_strict = (params.distill_stage == "second") and not params.finetune
+    logging.info(f"Loading student model from {student_ckpt}")
     _ = load_checkpoint(
-        filename=params.teacher_model,
+        filename=student_ckpt,
         model=model,
         strict=load_strict,
     )
