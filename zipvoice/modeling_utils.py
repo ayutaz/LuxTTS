@@ -15,7 +15,6 @@ from transformers import pipeline
 from huggingface_hub import snapshot_download
 from lhotse.utils import fix_random_seed
 
-from zipvoice.models.zipvoice_distill import ZipVoiceDistill
 from zipvoice.tokenizer.tokenizer import EmiliaTokenizer
 from zipvoice.utils.checkpoint import load_checkpoint
 from zipvoice.utils.common import AttributeDict, str2bool
@@ -93,7 +92,7 @@ def generate(prompt_tokens, prompt_features_lens, prompt_features, prompt_rms, t
 
     return wav
 
-def load_models_gpu(model_path=None, device="cuda", lang=None):
+def load_models_gpu(model_path=None, device="cuda", lang=None, model_name='zipvoice_distill'):
     params = LuxTTSConfig()
     if model_path is None:
         model_path = snapshot_download("YatharthS/LuxTTS")
@@ -109,11 +108,13 @@ def load_models_gpu(model_path=None, device="cuda", lang=None):
     with open(model_config, "r", encoding="utf-8") as f:
         model_config = json.load(f)
 
-    model = ZipVoiceDistill(
-        **model_config["model"],
-        **tokenizer_config,
-    )
-    load_checkpoint(filename=model_ckpt, model=model, strict=True)
+    if model_name == 'zipvoice_distill':
+        from zipvoice.models.zipvoice_distill import ZipVoiceDistill
+        model = ZipVoiceDistill(**model_config["model"], **tokenizer_config)
+    else:
+        from zipvoice.models.zipvoice import ZipVoice
+        model = ZipVoice(**model_config["model"], **tokenizer_config)
+    load_checkpoint(filename=model_ckpt, model=model, strict=False)
     params.device = torch.device(device, 0)
 
     model = model.to(params.device).eval()

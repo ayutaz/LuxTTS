@@ -9,7 +9,7 @@ class LuxTTS:
     LuxTTS class for encoding prompt and generating speech on cpu/cuda/mps.
     """
 
-    def __init__(self, model_path='YatharthS/LuxTTS', device='cuda', threads=4, lang: Optional[str] = None):
+    def __init__(self, model_path='YatharthS/LuxTTS', device='cuda', threads=4, lang: Optional[str] = None, model_name='zipvoice_distill'):
         if model_path == 'YatharthS/LuxTTS':
             model_path = None
 
@@ -28,7 +28,7 @@ class LuxTTS:
             model, feature_extractor, vocos, tokenizer, transcriber = load_models_cpu(model_path, threads, lang=lang)
             print("Loading model on CPU")
         else:
-            model, feature_extractor, vocos, tokenizer, transcriber = load_models_gpu(model_path, device=device, lang=lang)
+            model, feature_extractor, vocos, tokenizer, transcriber = load_models_gpu(model_path, device=device, lang=lang, model_name=model_name)
             print("Loading model on GPU")
 
         self.model = model
@@ -37,6 +37,7 @@ class LuxTTS:
         self.tokenizer = tokenizer
         self.transcriber = transcriber
         self.device = device
+        self.model_name = model_name
         self.vocos.freq_range = 12000
 
 
@@ -48,8 +49,11 @@ class LuxTTS:
 
         return encode_dict
 
-    def generate_speech(self, text, encode_dict, num_steps=4, guidance_scale=3.0, t_shift=0.5, speed=1.0, return_smooth=False):
+    def generate_speech(self, text, encode_dict, num_steps=None, guidance_scale=3.0, t_shift=0.5, speed=1.0, return_smooth=False):
         """encodes text and generates speech using flow matching model according to steps, guidance scale, and t_shift(like temp)"""
+
+        if num_steps is None:
+            num_steps = 4 if self.model_name == 'zipvoice_distill' else 16
 
         prompt_tokens, prompt_features_lens, prompt_features, prompt_rms = encode_dict.values()
 
