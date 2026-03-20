@@ -76,6 +76,110 @@ CLI推論スクリプト: `zipvoice/bin/infer_zipvoice.py`（GPU用）、`zipvoi
 
 ### 日本語対応
 
+#### 環境構築
+
+```bash
+# 1. uvで仮想環境を作成（Python 3.10推奨）
+uv venv --python 3.10
+uv pip install -e ".[train]"
+
+# onnxruntimeはPython 3.10では<=1.23.2が必要
+# pyproject.tomlに設定済み
+
+# 2. テストの実行
+uv run pytest tests/test_japanese_tokenizer.py -v
+```
+
+**主要な依存関係:**
+- `pyopenjtalk-plus` — 日本語G2P（grapheme-to-phoneme）
+- `torch` + `torchaudio` — 学習・推論
+- `lhotse` — データ準備・読み込み
+- `transformers` — Whisper（音声プロンプトの書き起こし）
+- `einops` — 学習時のみ（`[train]`オプション）
+
+**Windows固有の注意:**
+- `PYTHONUTF8=1`環境変数が必須（日本語テキストのエンコーディング）
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`推奨（CUDAメモリ断片化対策）
+- `scaling.py`のSwooshLForward/SwooshRForwardは`torch.logaddexp`を使用（k2ライブラリなし環境でのexp()オーバーフロー対策）
+
+#### データ準備
+
+```bash
+# 1. データセットのダウンロード（例: moe-speech-20speakers-ljspeech）
+huggingface-cli download --repo-type dataset ayousanz/moe-speech-20speakers-ljspeech \
+    --local-dir data/moe-speech-20speakers-ljspeech
+cd data/moe-speech-20speakers-ljspeech && unzip wavs.zip
+
+# 2. TSV変換 + リサンプリング（22kHz→24kHz）
+python scripts/convert_moe_speech.py --num-workers 8
+
+# 3. Lhotseマニフェスト生成
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_dataset \
+    --tsv-path data/custom_train.tsv --prefix custom --subset train \
+    --output-dir data/manifests --sampling-rate 24000
+
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_dataset \
+    --tsv-path data/custom_dev.tsv --prefix custom --subset dev \
+    --output-dir data/manifests --sampling-rate 24000
+
+# 4. 日本語トークン化（pyopenjtalk G2P）
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_tokens \
+    --input-file data/manifests/custom_cuts_train.jsonl.gz \
+    --output-file data/manifests/custom_cuts_train_tokens.jsonl.gz \
+    --tokenizer emilia --lang ja
+
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_tokens \
+    --input-file data/manifests/custom_cuts_dev.jsonl.gz \
+    --output-file data/manifests/custom_cuts_dev_tokens.jsonl.gz \
+    --tokenizer emilia --lang ja
+
+# 5. VocosFbank特徴量抽出（100次元メルスペクトログラム、24kHz）
+PYTHONUTF8=1 python -m zipvoice.bin.compute_fbank \
+    --source-dir data/manifests --dest-dir data/fbank \
+    --dataset custom --subset train_tokens --sampling-rate 24000 --type vocos
+
+PYTHONUTF8=1 python -m zipvoice.bin.compute_fbank \
+    --source-dir data/manifests --dest-dir data/fbank \
+    --dataset custom --subset dev_tokens --sampling-rate 24000 --type vocos
+```
+
+#### 事前学習モデルの準備
+
+```bash
+# 1. HuggingFaceからダウンロード
+python -c "from huggingface_hub import snapshot_download; snapshot_download('YatharthS/LuxTTS', local_dir='data/pretrained')"
+
+# 2. 日本語トークンファイル生成（英語360 + 日本語41 = 401トークン）
+python scripts/generate_tokens.py
+
+# 3. 埋め込み層の初期化（英語音素→日本語音素マッピング）
+python scripts/init_japanese_embeds.py
+```
+
+#### 学習の実行
+
+```bash
+# 一括実行
+bash scripts/train_japanese.sh
+
+# または手動で実行（パラメータ調整可能）
+PYTHONUTF8=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python -m zipvoice.bin.train_zipvoice \
+    --world-size 1 --use-fp16 1 --finetune 1 \
+    --model-name zipvoice --num-epochs 50 --max-duration 80 \
+    --base-lr 0.0001 --grad-accum-steps 2 --early-stopping-patience 5 \
+    --model-config data/pretrained/config.json \
+    --tokenizer emilia --lang ja --token-file data/tokens_ja.txt \
+    --dataset custom \
+    --train-manifest data/fbank/custom_cuts_train_tokens.jsonl.gz \
+    --dev-manifest data/fbank/custom_cuts_dev_tokens.jsonl.gz \
+    --manifest-dir data/fbank \
+    --checkpoint data/pretrained/model_ja_distill_v3.pt \
+    --exp-dir exp/zipvoice_ja --save-every-n 5000 --num-workers 8
+```
+
+**学習時間:** RTX 4090で約24時間（Early stoppingにより30エポック前後で停止）
+
 #### 推論
 ```python
 from zipvoice.luxvoice import LuxTTS

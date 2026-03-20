@@ -123,42 +123,84 @@ Thanks to all community contributions!
 
 LuxTTS supports Japanese text-to-speech via a community-contributed Japanese G2P pipeline built on `pyopenjtalk-plus`.
 
-### Dependencies
-
-Install the required Japanese G2P package:
+### Environment Setup
 
 ```bash
+# uv (recommended)
+uv venv --python 3.10
+uv pip install -e ".[train]"
+
+# or pip
+pip install -e ".[train]"
 pip install pyopenjtalk-plus
 ```
 
-### Quick Start
+> **Windows users:** Set `PYTHONUTF8=1` environment variable before running any commands.
+
+### Quick Start (Inference)
 
 ```python
 from zipvoice.luxvoice import LuxTTS
-import torch
+import torch, soundfile as sf
 
+# Load with Japanese support (uses base ZipVoice model, not distill)
 lux = LuxTTS('YatharthS/LuxTTS', device='cuda', lang='ja', model_name='zipvoice')
+
 # Load Japanese fine-tuned weights
 ckpt = torch.load('path/to/japanese_checkpoint.pt', map_location='cuda', weights_only=False)
 lux.model.load_state_dict(ckpt['model'], strict=False)
 
-prompt = lux.encode_prompt('reference.wav', duration=5, rms=0.01)
-audio = lux.generate_speech("こんにちは、今日はいい天気ですね。", prompt, num_steps=16)
+# Generate speech (base model uses 16 steps, auto-selected)
+prompt = lux.encode_prompt('japanese_reference.wav', duration=5, rms=0.01)
+audio = lux.generate_speech("こんにちは、今日はいい天気ですね。", prompt)
+
+sf.write('output.wav', audio.numpy().squeeze(), 48000)
 ```
 
 ### Training a Japanese Model
 
-To fine-tune LuxTTS on Japanese data:
+#### Step 1: Data Preparation
+```bash
+# Download dataset (example: moe-speech-20speakers-ljspeech, ~21GB)
+huggingface-cli download --repo-type dataset ayousanz/moe-speech-20speakers-ljspeech \
+    --local-dir data/moe-speech-20speakers-ljspeech
 
-1. **Prepare data** using the [moe-speech](https://huggingface.co/datasets/moe-speech) dataset or your own Japanese audio corpus.
-2. **Run training** using the provided script:
-   ```bash
-   bash scripts/train_japanese.sh
-   ```
-3. **Key parameters** for Japanese training and inference:
-   - `model_name='zipvoice'` -- use the base (non-distilled) model
-   - `lang='ja'` -- enables Japanese G2P via pyopenjtalk-plus
-   - `num_steps=16` -- recommended step count for the base model
+# Convert to LuxTTS format (resample 22kHz→24kHz, split train/dev)
+python scripts/convert_moe_speech.py --num-workers 8
+
+# Build training features (manifest → tokens → mel-spectrogram)
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_dataset \
+    --tsv-path data/custom_train.tsv --prefix custom --subset train \
+    --output-dir data/manifests --sampling-rate 24000
+PYTHONUTF8=1 python -m zipvoice.bin.prepare_tokens \
+    --input-file data/manifests/custom_cuts_train.jsonl.gz \
+    --output-file data/manifests/custom_cuts_train_tokens.jsonl.gz \
+    --tokenizer emilia --lang ja
+PYTHONUTF8=1 python -m zipvoice.bin.compute_fbank \
+    --source-dir data/manifests --dest-dir data/fbank \
+    --dataset custom --subset train_tokens --sampling-rate 24000 --type vocos
+# Repeat for dev split
+```
+
+#### Step 2: Initialize & Train
+```bash
+# Generate token file and initialize embeddings
+python scripts/generate_tokens.py
+python scripts/init_japanese_embeds.py
+
+# Run training (~24h on RTX 4090)
+bash scripts/train_japanese.sh
+```
+
+#### Key Parameters
+| Parameter | Value | Note |
+|---|---|---|
+| `model_name` | `'zipvoice'` | Base model (not distill) |
+| `lang` | `'ja'` | Japanese G2P via pyopenjtalk-plus |
+| `num_steps` | `16` | Base model EulerSolver (not 4-step distill) |
+| `base-lr` | `0.0001` | 0.0005 causes divergence |
+
+See [`scripts/train_japanese.sh`](scripts/train_japanese.sh) for the full training configuration.
 
 > **Note:** Japanese language support is a community contribution. See the [Community](#community) section for more projects built around LuxTTS.
 
