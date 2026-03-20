@@ -119,6 +119,49 @@ if display is not None:
 
 Thanks to all community contributions!
 
+## Japanese Language Support
+
+LuxTTS supports Japanese text-to-speech via a community-contributed Japanese G2P pipeline built on `pyopenjtalk-plus`.
+
+### Dependencies
+
+Install the required Japanese G2P package:
+
+```bash
+pip install pyopenjtalk-plus
+```
+
+### Quick Start
+
+```python
+from zipvoice.luxvoice import LuxTTS
+import torch
+
+lux = LuxTTS('YatharthS/LuxTTS', device='cuda', lang='ja', model_name='zipvoice')
+# Load Japanese fine-tuned weights
+ckpt = torch.load('path/to/japanese_checkpoint.pt', map_location='cuda', weights_only=False)
+lux.model.load_state_dict(ckpt['model'], strict=False)
+
+prompt = lux.encode_prompt('reference.wav', duration=5, rms=0.01)
+audio = lux.generate_speech("こんにちは、今日はいい天気ですね。", prompt, num_steps=16)
+```
+
+### Training a Japanese Model
+
+To fine-tune LuxTTS on Japanese data:
+
+1. **Prepare data** using the [moe-speech](https://huggingface.co/datasets/moe-speech) dataset or your own Japanese audio corpus.
+2. **Run training** using the provided script:
+   ```bash
+   bash scripts/train_japanese.sh
+   ```
+3. **Key parameters** for Japanese training and inference:
+   - `model_name='zipvoice'` -- use the base (non-distilled) model
+   - `lang='ja'` -- enables Japanese G2P via pyopenjtalk-plus
+   - `num_steps=16` -- recommended step count for the base model
+
+> **Note:** Japanese language support is a community contribution. See the [Community](#community) section for more projects built around LuxTTS.
+
 ## Info
 
 Q: How is this different from ZipVoice?

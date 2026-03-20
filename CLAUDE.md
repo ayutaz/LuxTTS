@@ -73,3 +73,43 @@ CLI推論スクリプト: `zipvoice/bin/infer_zipvoice.py`（GPU用）、`zipvoi
 - `t_shift`: 0.5–0.9 — 発音の明瞭さを制御
 - `guidance_scale`: デフォルト3.0 — プロンプト忠実度とテキスト忠実度のバランス
 - `speed`: デフォルト1.3倍 — 時間方向のスケーリング
+
+### 日本語対応
+
+#### 推論
+```python
+from zipvoice.luxvoice import LuxTTS
+
+# 日本語モデルの読み込み（ZipVoice BASEモデルを使用）
+lux_tts = LuxTTS('path/to/model', device='cuda', lang='ja', model_name='zipvoice')
+
+# ファインチューニング済み重みの読み込み
+import torch
+ckpt = torch.load('exp/zipvoice_ja_v4/best-valid-loss.pt', map_location='cuda', weights_only=False)
+lux_tts.model.load_state_dict(ckpt['model'], strict=False)
+
+# 音声生成（BASEモデルはnum_steps=16が推奨）
+encoded_prompt = lux_tts.encode_prompt('reference_audio.wav', duration=5, rms=0.01)
+audio = lux_tts.generate_speech("こんにちは、今日はいい天気ですね。", encoded_prompt, num_steps=16, t_shift=0.9)
+```
+
+#### 日本語学習パイプライン
+1. データ準備: `scripts/convert_moe_speech.py` → TSV変換 + リサンプリング
+2. マニフェスト: `prepare_dataset.py` → Lhotseマニフェスト生成
+3. トークン化: `prepare_tokens.py --lang ja` → pyopenjtalk G2P
+4. 特徴量: `compute_fbank.py` → VocosFbank (100次元, 24kHz)
+5. 埋め込み初期化: `scripts/init_japanese_embeds.py` → 英語音素マッピング
+6. 学習: `scripts/train_japanese.sh` → ZipVoice BASE + AdamW + FP16
+
+#### 重要な注意事項
+- 学習にはZipVoice（ベース）を使用、推論時も`model_name='zipvoice'`を指定
+- `model_name='zipvoice_distill'`は英語/中国語の事前学習モデル用
+- BASEモデルのEulerSolverは16ステップ以上が推奨（DistillEulerSolverの4ステップとは異なる）
+- J_トークンの埋め込みは英語音素からマッピング初期化する（ランダム初期化は不可）
+- `scaling.py`のSwooshLForward/SwooshRForwardは`torch.logaddexp`を使用（exp()オーバーフロー対策）
+
+#### トークン体系
+- 英語: espeak IPA音素（ID 0-159）
+- 中国語: pypinyin（ID 160-359）
+- 日本語: pyopenjtalk + J_プレフィックス（ID 360-400、41トークン）
+- 例: こんにちは → J_k J_o J_N J_n J_i J_ch J_i J_w J_a
